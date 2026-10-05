@@ -1,0 +1,816 @@
+
+
+(function () {
+    'use strict';
+
+    const FRAGMENT_TYPE = 60107;
+    const REACT_SUSPENSE_TYPE = 'react.suspense';
+    const KNOWN_TAGS = '0IETPHA';
+    const MAX_ROW_ID_CHARS = 16;
+    const MAX_TEXT_LEN_CHARS = 16;
+    // A uint64 is 16 hex digits, so that is the width of ids and of lengths.
+    // The digit count bounds the *encoding* of a length, never its value:
+    // 16 digits reach 2^64-1. These bound the value and the total buffer.
+    // Largest real row in this project is ~5.6 KB (/heavy), so ~175x headroom.
+    const MAX_TEXT_LEN_BYTES = 1 << 20;   // 1 MiB per T row
+    const MAX_BUFFER_BYTES = 4 << 20;     // 4 MiB buffered
+
+    const TEXT_ENCODER = new TextEncoder();
+    const TEXT_DECODER = new TextDecoder('utf-8', { fatal: true });
+    const COLON = 58;   
+    const COMMA = 44;   
+
+    function indexOfByte(bytes, target, from) {
+        for (let i = from; i < bytes.length; i++) if (bytes[i] === target) return i;
+        return -1;
+    }
+
+    const ACTION_RESULT_ROW_ID = 0x9c40000000000000;
+
+    class FlightDecoder {
+        constructor() {
+            this.reset();
+        }
+
+        reset() {
+            this.buf = '';
+            this.chunks = new Map();     
+            this.rawRows = [];           
+            this.error = null;           
+            this.actionResult = undefined;
+            this.postponed = new Set();  
+
+            // `reset()` runs from the constructor, before `listeners` exists.
+            // Read-then-replace only matters on a *re*-reset, which supersedes
+            // any still-unsettled waits from a newer response.
+            const pending = this.listeners;
+            this.listeners = new Map();
+            if (pending !== undefined && pending.size > 0) {
+                for (const entry of pending.values()) {
+                    for (const w of entry) w.reject(new Error('superseded by a newer response'));
+                }
+            }
+        }
+
+        get ok() { return this.error === null; }
+
+        feed(data) {
+            if (this.error !== null) return;
+            // Bound total buffered size before the append. Without this, a
+            // declared-but-undelivered length prefix made every feed append
+            // forever while `buf` grew with no cap.
+            if (this.buf.length + data.length > MAX_BUFFER_BYTES) {
+                this._fail('stream buffer limit exceeded');
+                return;
+            }
+            this.buf += data;
+            this._drain();
+        }
+
+        _fail(msg) {
+            this.error = msg;
+            this.buf = '';
+            for (const [, entry] of this.listeners) {
+                for (const w of entry) w.reject(new Error(msg));
+            }
+            this.listeners.clear();
+        }
+
+        _drain() {
+            for (;;) {
+                const colon = this.buf.indexOf(':');
+                if (colon === -1) {
+                    if (this.buf.length > MAX_ROW_ID_CHARS) this._fail('row id is too long');
+                    return;
+                }
+                if (colon === 0) { this._fail('row id is empty'); return; }
+                if (colon + 1 >= this.buf.length) return;
+
+                // MAX_ROW_ID_CHARS must bound the id on every path. parseInt on
+                // a wider string wraps, so two distinct row ids would alias to
+                // one Number and collide in the reference table.
+                if (colon > MAX_ROW_ID_CHARS) { this._fail('row id is too long'); return; }
+
+                const idStr = this.buf.slice(0, colon);
+                if (!/^[0-9a-f]+$/.test(idStr)) { this._fail('invalid hexadecimal row id: ' + idStr); return; }
+                const id = parseInt(idStr, 16);
+                const tag = this.buf[colon + 1];
+
+                if (tag === 'T') {
+                    const bytes = TEXT_ENCODER.encode(this.buf);
+                    const colonB = indexOfByte(bytes, COLON, 0);
+                    const commaB = indexOfByte(bytes, COMMA, colonB + 1);
+                    // The digit guard belongs here, NOT inside `commaB === -1`.
+                    // It used to be, so once the comma landed the digit count was
+                    // never validated and a megabyte of digits reached parseInt.
+                    const digitEnd = commaB === -1 ? bytes.length : commaB;
+                    if (digitEnd - (colonB + 2) > MAX_TEXT_LEN_CHARS) {
+                        this._fail('text length prefix is too long');
+                        return;
+                    }
+                    if (commaB === -1) return;
+                    const lenStr = TEXT_DECODER.decode(bytes.subarray(colonB + 2, commaB));
+                    if (!/^[0-9a-f]+$/.test(lenStr)) { this._fail('invalid hexadecimal text length: ' + lenStr); return; }
+                    const len = parseInt(lenStr, 16);
+                    // The digit count bounds the encoding of len, not len itself.
+                    if (len > MAX_TEXT_LEN_BYTES) {
+                        this._fail('text length exceeds limit');
+                        return;
+                    }
+                    const bodyB = commaB + 1;
+                    if (bytes.length - bodyB < len) return;  
+                    this._resolve(id, TEXT_DECODER.decode(bytes.subarray(bodyB, bodyB + len)));
+                    this.buf = TEXT_DECODER.decode(bytes.subarray(bodyB + len));
+                    continue;
+                }
+
+                const nl = this.buf.indexOf('\n', colon);
+                if (nl === -1) return;  
+
+                const line = this.buf.slice(0, nl);
+                this.buf = this.buf.slice(nl + 1);
+                this._handleLine(id, line);
+            }
+        }
+
+        _handleLine(id, line) {
+            this._remember(line);
+            const rest = line.slice(line.indexOf(':') + 1);
+            if (rest === '') { this._fail('row has no payload'); return; }
+
+            const tag = KNOWN_TAGS.indexOf(rest[0]) !== -1 ? rest[0] : 0;
+            const body = tag ? rest.slice(1) : rest;
+
+            if (tag === 'P') {
+                this.postponed.add(id);
+                return;
+            }
+
+            if (tag === 'E') {
+                let msg = 'Server error';
+                try { msg = JSON.parse(body).message || msg; } catch (e) {  }
+                this._resolve(id, { __error: msg });
+                return;
+            }
+
+            let payload;
+            try {
+                payload = JSON.parse(body);
+            } catch (e) {
+                this._fail('row ' + id.toString(16) + ' is not valid JSON');
+                return;
+            }
+
+            if (tag === 'I') {
+                this._resolve(id, {
+                    __client: true,
+                    module: payload.id,
+                    exportName: payload.name || 'default',
+                    refId: id
+                });
+                return;
+            }
+
+            if (tag === 'A') {
+                this.actionResult = payload;
+                this._resolve(id, payload);
+                return;
+            }
+            this._resolve(id, payload);
+        }
+
+        getActionResult() {
+            return this.actionResult === undefined ? null : this.actionResult;
+        }
+
+        _remember(line) {
+            this.rawRows.push(line);
+            if (this.rawRows.length > 400) this.rawRows.shift();
+            window.dispatchEvent(new CustomEvent('rsc:row', { detail: line }));
+        }
+
+        _resolve(id, value) {
+            this.chunks.set(id, value);
+            this.postponed.delete(id);
+            const entry = this.listeners.get(id);
+            if (entry) {
+                this.listeners.delete(id);
+                for (const w of entry) w.resolve(value);
+            }
+        }
+
+        has(id) { return this.chunks.has(id); }
+
+        get(id) { return this.chunks.get(id); }
+
+        when(id) {
+            if (this.chunks.has(id)) return Promise.resolve(this.chunks.get(id));
+            if (this.error !== null) return Promise.reject(new Error(this.error));
+            return new Promise((resolve, reject) => {
+                if (!this.listeners.has(id)) this.listeners.set(id, []);
+                this.listeners.get(id).push({ resolve, reject });
+            });
+        }
+
+        async whenOrNull(id) {
+            if (this.error !== null) return null;
+            try { return await this.when(id); } catch (e) { return null; }
+        }
+    }
+
+    function isRefString(s) {
+        if (typeof s !== 'string' || s.length < 2) return false;
+        if (s === '$undefined' || s === '$Infinity' || s === '$-Infinity' ||
+            s === '$NaN' || s === '$-0') return true;
+        if (s.startsWith('$L') || s.startsWith('$@') || s.startsWith('$F') ||
+            s.startsWith('$S') || s.startsWith('$D') || s.startsWith('$n')) return true;
+        if (s[0] === '$' && /^[0-9a-f]+$/.test(s.slice(1))) return true;
+        return false;
+    }
+
+    function resolveRef(s, decoder) {
+        if (s === '$undefined') return undefined;
+        if (s === '$Infinity') return Infinity;
+        if (s === '$-Infinity') return -Infinity;
+        if (s === '$NaN') return NaN;
+        if (s === '$-0') return -0;
+        if (s.startsWith('$S')) return { $$typeof: 'symbol', name: s.slice(2) };
+        if (s.startsWith('$D')) return new Date(s.slice(2));
+        if (s.startsWith('$n')) return BigInt(s.slice(2));
+        if (s.startsWith('$L')) {
+            const id = parseInt(s.slice(2), 16);
+            const meta = decoder.chunks.get(id);
+            if (meta !== undefined) {
+                if (meta.__client) return meta;
+                return resolveValue(meta, decoder);
+            }
+            return { __lazy: id };
+        }
+        if (s.startsWith('$@')) return { __promise: parseInt(s.slice(2), 16) };
+        if (s.startsWith('$F')) return { __serverAction: parseInt(s.slice(2), 16) };
+        if (s[0] === '$') {
+            const id = parseInt(s.slice(1), 16);
+            const meta = decoder.chunks.get(id);
+            if (meta === undefined) return s; 
+            return resolveValue(meta, decoder);
+        }
+        return s;
+    }
+
+    function resolveValue(v, decoder) {
+        if (typeof v === 'string') return isRefString(v) ? resolveRef(v, decoder) : v;
+        if (Array.isArray(v)) {
+            if (v.length > 0 && v[0] === '$') return resolveElement(v, decoder);
+            return v.map((x) => resolveValue(x, decoder));
+        }
+        if (v && typeof v === 'object') {
+            if (v.__resolved) return v;
+            const out = {};
+            for (const k in v) {
+                if (v[k] == null) { out[k] = v[k]; continue; }
+                out[k] = resolveValue(v[k], decoder);
+            }
+            return out;
+        }
+        return v;
+    }
+
+    function resolveType(type, decoder) {
+        if (typeof type === 'string') {
+            if (isRefString(type)) return resolveRef(type, decoder);
+            return type;
+        }
+        return type;
+    }
+
+    // The server encodes Suspense as the "$Sreact.suspense" symbol reference,
+    // which resolves to { $$typeof: 'symbol', name: 'react.suspense' }.
+    function isSuspenseType(type) {
+        return !!type && typeof type === 'object' && type.$$typeof === 'symbol' &&
+               type.name === REACT_SUSPENSE_TYPE;
+    }
+
+    function resolveElement(arr, decoder) {
+        const typeRaw = arr[1];
+        const keyRaw = arr[2];
+        const propsRaw = arr[3] || {};
+        const type = resolveType(typeRaw, decoder);
+        const props = resolveValue(propsRaw, decoder);
+        let children = props.children;
+        if (children == null) children = [];
+        else if (!Array.isArray(children)) children = [children];
+        return { type, key: keyRaw, props, children };
+    }
+
+    function asElementArray(val) {
+        if (Array.isArray(val) && val.length && val[0] === '$') return val;
+        return ['$', FRAGMENT_TYPE, null, { children: val }];
+    }
+
+    const decoder = new FlightDecoder();
+
+    const URL_ATTRS = new Set(['href', 'src', 'srcset', 'action', 'formaction', 'poster', 'cite', 'ping']);
+    const SAFE_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:', 'ftp:']);
+
+    function isSafeUrlAttr(name, value) {
+        if (!URL_ATTRS.has(name)) return true;
+        const v = value.replace(/^[\u0000-\u0020]+/, '');
+        if (v === '') return true;
+        if (v.startsWith('#') || v.startsWith('/') || v.startsWith('?')) return true;
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(v)) {
+            let scheme;
+            try { scheme = new URL(v, location.origin).protocol; } catch (e) { return false; }
+            return SAFE_SCHEMES.has(scheme);
+        }
+        return true;  
+    }
+
+    function applyProps(el, props) {
+        for (const k in props) {
+            if (k === 'children' || k === 'key' || k === 'ref') continue;
+            if (k.startsWith('on')) continue;             
+            if (k === 'dangerouslySetInnerHTML') continue; 
+            if (k === 'style') continue;                  
+            const v = props[k];
+            if (v == null) continue;
+            if (typeof v === 'object') continue; 
+            if (!isSafeUrlAttr(k, typeof v === 'string' ? v : String(v))) continue;
+            if (k === 'className') { el.setAttribute('class', String(v)); continue; }
+            if (k === 'htmlFor') { el.setAttribute('for', String(v)); continue; }
+            if (typeof v === 'boolean') { if (v) el.setAttribute(k, ''); continue; }
+            el.setAttribute(k, String(v));
+        }
+    }
+
+    async function mountChild(child, parent) {
+        if (child == null) return;
+        const t = typeof child;
+        if (t === 'string' || t === 'number' || t === 'boolean') {
+            parent.appendChild(document.createTextNode(String(child)));
+            return;
+        }
+        if (t !== 'object') return;
+        if (Array.isArray(child)) {
+            const node = resolveElement(child, decoder);
+            await mountNode(node, parent);
+            return;
+        }
+        if (child.__lazy !== undefined) {
+            const val = await decoder.whenOrNull(child.__lazy);
+            if (val === null) { mountError(parent, 'client reference never arrived'); return; }
+            await mountNode(resolveElement(asElementArray(val), decoder), parent);
+            return;
+        }
+        if (child.__promise !== undefined) {
+            const val = await decoder.whenOrNull(child.__promise);
+            if (val === null) { mountError(parent, 'promised value never arrived'); return; }
+            await mountNode(resolveElement(asElementArray(val), decoder), parent);
+            return;
+        }
+        if (child.__serverAction !== undefined) return;
+        if (child.__postponed !== undefined) return;
+        if (child.__error !== undefined) {
+            const span = document.createElement('span');
+            span.className = 'rsc-error-fallback';
+            span.textContent = '[server error] ' + child.__error;
+            parent.appendChild(span);
+            return;
+        }
+        await mountNode(child, parent);
+    }
+
+    function mountError(parent, message) {
+        const span = document.createElement('span');
+        span.className = 'rsc-error-fallback';
+        span.textContent = message;
+        parent.appendChild(span);
+    }
+
+    async function mountNode(node, parent) {
+        if (node == null) return;
+
+        if (node.type && typeof node.type === 'object' && node.type.__lazy !== undefined) {
+            const meta = await decoder.whenOrNull(node.type.__lazy);
+            if (meta === null) { mountError(parent, 'client reference never arrived'); return; }
+            node = { ...node, type: meta };
+        }
+
+        if (node.__lazy !== undefined) { await mountChild(node, parent); return; }
+        if (node.__promise !== undefined) { await mountChild(node, parent); return; }
+        if (node.__error !== undefined) { await mountChild(node, parent); return; }
+
+        if (node.type === FRAGMENT_TYPE) {
+            for (const c of node.children) await mountChild(c, parent);
+            return;
+        }
+        if (isSuspenseType(node.type)) {
+            await mountSuspense(node, parent);
+            return;
+        }
+        if (node.type && typeof node.type === 'object') {
+            if (node.type.__client) { await mountClient(node, parent); return; }
+            if (node.type.__serverAction !== undefined) return;
+            if (node.type.__error !== undefined) return;
+            if (node.type.$$typeof === 'symbol') return;
+        }
+        if (typeof node.type === 'number') return;
+        if (typeof node.type !== 'string') return;
+
+        const el = document.createElement(node.type);
+        applyProps(el, node.props);
+        for (const c of node.children) await mountChild(c, el);
+        parent.appendChild(el);
+    }
+
+    async function mountSuspense(node, parent) {
+        const child = node.props.children;
+        const lazy = (child && typeof child === 'object' && child.__lazy !== undefined)
+            ? child.__lazy : null;
+        const promise = (child && typeof child === 'object' && child.__promise !== undefined)
+            ? child.__promise : null;
+
+        if (lazy === null && promise === null) {
+            if (child == null) {
+                await mountNode(node.props.fallback, parent);
+            } else {
+                await mountNode(child, parent);
+            }
+            return;
+        }
+
+        const fb = document.createElement('div');
+        fb.className = 'rsc-fallback';
+        const ct = document.createElement('div');
+        ct.className = 'rsc-content';
+        ct.style.display = 'none';
+        const container = document.createElement('div');
+        container.className = 'rsc-boundary';
+        container.appendChild(fb);
+        container.appendChild(ct);
+        parent.appendChild(container);
+
+        if (node.props.fallback) await mountNode(node.props.fallback, fb);
+
+        const showContent = async (contentNode) => {
+            fb.style.display = 'none';
+            ct.style.display = '';
+            await mountNode(contentNode, ct);
+        };
+
+        const waitId = lazy === null ? promise : lazy;
+        const swap = (val) => showContent(resolveElement(asElementArray(val), decoder));
+        const cached = decoder.whenOrNull(waitId);
+        cached.then((val) => { if (val !== null) swap(val); });
+    }
+
+    function createComponentController(node, slot, comp) {
+        const instance = { hooks: [], cursor: 0 };
+        const parent = slot.parentElement;
+
+        function getHook() {
+            const i = instance.cursor++;
+            if (i >= instance.hooks.length) instance.hooks.push({});
+            return instance.hooks[i];
+        }
+
+        const api = {
+            rsc,
+            useState(initial) {
+                const h = getHook();
+                if (h.state === undefined) h.state = initial;
+                const set = (next) => {
+                    const v = typeof next === 'function' ? next(h.state) : next;
+                    if (Object.is(v, h.state)) return;
+                    h.state = v;
+                    render();
+                };
+                return [h.state, set];
+            }
+        };
+
+        function commit(result) {
+            const host = document.createElement('span');
+            host.className = 'rsc-client';
+            if (result instanceof Node || result instanceof HTMLElement) {
+                host.appendChild(result);
+            } else {
+                host.textContent = String(result == null ? '' : result);
+            }
+            if (slot.isConnected) {
+                slot.replaceChildren(host);
+            } else if (parent && parent.isConnected) {
+                const existing = parent.querySelector('.rsc-client');
+                if (existing) existing.replaceWith(host); else parent.appendChild(host);
+            } else {
+                return;
+            }
+        }
+
+        function render() {
+            instance.cursor = 0;
+            let result;
+            try {
+                result = comp(node.props || {}, api);
+            } catch (e) {
+                if (slot.isConnected) slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
+                console.error('[rsc] client component failed:', e);
+                return;
+            }
+            if (result && typeof result.then === 'function') {
+                result.then(commit).catch((e) => {
+                    if (slot.isConnected) slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
+                    console.error('[rsc] client component failed:', e);
+                });
+            } else {
+                commit(result);
+            }
+        }
+
+        return render;
+    }
+
+    const moduleCache = new Map();
+    async function mountClient(node, parent) {
+        const slot = document.createElement('span');
+        slot.className = 'rsc-client';
+        slot.textContent = '[loading client component…]';
+        parent.appendChild(slot);
+        try {
+            let mod = moduleCache.get(node.type.module);
+            if (!mod) { mod = await import(node.type.module); moduleCache.set(node.type.module, mod); }
+            const comp = mod[node.type.exportName || 'default'];
+            if (typeof comp !== 'function') {
+                throw new Error('export "' + (node.type.exportName || 'default') + '" not found in ' + node.type.module);
+            }
+            const render = createComponentController(node, slot, comp);
+            render();
+        } catch (e) {
+            slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
+            console.error('[rsc] client component failed:', e.message);
+        }
+    }
+
+    function childrenOf(node) {
+        if (!node) return [];
+        const out = [];
+        const visit = (v) => {
+            if (v == null || typeof v !== 'object') return;
+            if (Array.isArray(v)) {
+                if (v.length && v[0] === '$') out.push(resolveElement(v, decoder));
+                else for (const x of v) visit(x);
+                return;
+            }
+            if (v.__lazy !== undefined || v.__promise !== undefined) return;  
+            out.push(v);
+        };
+        for (const c of (node.children || [])) visit(c);
+        return out;
+    }
+
+    function hydrateTree(node) {
+        if (!node) return;
+        if (node.type && typeof node.type === 'object' && node.type.__client) {
+            const t = node.type;
+            const slot = document.querySelector('template[data-rsc-client="' + t.refId + '"]');
+            if (slot && slot.parentNode) {
+                const placeholder = document.createElement('span');
+                slot.parentNode.replaceChild(placeholder, slot);
+                mountClient(node, placeholder);
+            }
+            return;
+        }
+        if (node.type === FRAGMENT_TYPE || isSuspenseType(node.type) ||
+            typeof node.type === 'string') {
+            for (const c of childrenOf(node)) hydrateTree(c);
+        }
+    }
+
+    async function consumeStream(response) {
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw new Error('HTTP ' + response.status +
+                (detail ? ': ' + detail.slice(0, 200) : ''));
+        }
+        if (!response.body) {
+            throw new Error('response has no readable body');
+        }
+
+        const reader = response.body.getReader();
+        const td = new TextDecoder('utf-8', { fatal: false });
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                decoder.feed(td.decode(value, { stream: true }));
+            }
+            const tail = td.decode();
+            if (tail) decoder.feed(tail);
+        } catch (e) {
+            reader.cancel().catch(() => {});
+            throw e;
+        }
+
+        if (decoder.error !== null) {
+            throw new Error('malformed Flight stream: ' + decoder.error);
+        }
+        if (!decoder.has(0)) {
+            throw new Error('Flight stream ended without a root row');
+        }
+    }
+
+    function reportFatal(err, context) {
+        console.error('[rsc] ' + context + ':', err);
+        const root = document.getElementById('root');
+        if (!root) return;
+        const box = document.createElement('div');
+        box.className = 'rsc-error-fallback';
+        const h = document.createElement('h1');
+        h.textContent = 'Something went wrong';
+        const p = document.createElement('p');
+        p.textContent = context + ': ' + (err && err.message ? err.message : String(err));
+        box.appendChild(h);
+        box.appendChild(p);
+        root.replaceChildren(box);
+        window.dispatchEvent(new CustomEvent('rsc:error', { detail: { context, error: err } }));
+    }
+
+    async function mountRoot() {
+        const rootPayload = await decoder.when(0);
+        const rootEl = resolveElement(rootPayload, decoder);
+        const container = document.getElementById('root') || document.body;
+        container.replaceChildren();
+        await mountNode(rootEl, container);
+    }
+
+    let navEpoch = 0;
+
+    async function load(path, { historyMode = 'push', context = 'navigate' } = {}) {
+        const epoch = ++navEpoch;
+        const url = new URL(path, location.origin);
+        const flightPath = '/rsc' + url.pathname + url.search;
+
+        decoder.reset();
+        try {
+            const resp = await fetch(flightPath, {
+                headers: { Accept: 'text/x-component' },
+                credentials: 'same-origin'
+            });
+            if (epoch !== navEpoch) return;  
+            await consumeStream(resp);
+            if (epoch !== navEpoch) return;
+            await mountRoot();
+        } catch (e) {
+            if (epoch !== navEpoch) return;
+            reportFatal(e, context);
+            return;
+        }
+
+        if (historyMode === 'push') {
+            window.history.pushState({ rsc: true }, '', url.pathname + url.search);
+        } else {
+            window.history.replaceState({ rsc: true }, '', url.pathname + url.search);
+        }
+        window.scrollTo(0, 0);
+        window.dispatchEvent(new CustomEvent('rsc:nav', { detail: { path } }));
+    }
+
+    function navigate(path) {
+        return load(path, { historyMode: 'push', context: 'navigate' });
+    }
+
+    async function runAction(actionId, payload) {
+        const epoch = ++navEpoch;
+        decoder.reset();
+        try {
+            const resp = await fetch('/rsc/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'text/x-component' },
+                credentials: 'same-origin',
+                body: JSON.stringify({
+                    action_id: actionId,
+                    payload: payload || {},
+                    path: location.pathname
+                })
+            });
+            if (!resp.ok) {
+                await consumeStream(resp).catch(() => {});
+                const err = decoder.get(0);
+                const message = err && err.__error ? err.__error : ('action failed: HTTP ' + resp.status);
+                reportFatal(new Error(message), 'action "' + actionId + '"');
+                return null;
+            }
+            await consumeStream(resp);
+            if (epoch !== navEpoch) return null;  
+            await mountRoot();
+            window.dispatchEvent(new CustomEvent('rsc:action', {
+                detail: { actionId, result: decoder.getActionResult() }
+            }));
+            return decoder.getActionResult();
+        } catch (e) {
+            if (epoch === navEpoch) reportFatal(e, 'action "' + actionId + '"');
+            return null;
+        }
+    }
+
+    function isSameOriginLink(href) {
+        if (!href) return false;
+        if (href.startsWith('#')) return false;
+        let url;
+        try { url = new URL(href, location.href); } catch (e) { return false; }
+        if (url.origin !== location.origin) return false;
+        return url.protocol === 'http:' || url.protocol === 'https:';
+    }
+
+    function install() {
+        document.addEventListener('click', (e) => {
+            if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+            if (!a) return;
+            if (a.target && a.target !== '_self') return;
+            if (a.hasAttribute('download')) return;
+            if (a.getAttribute('data-no-rsc') != null) return;
+            if (!isSameOriginLink(a.getAttribute('href'))) return;
+            e.preventDefault();
+            navigate(a.getAttribute('href'));
+        });
+
+        document.addEventListener('submit', (e) => {
+            const form = e.target;
+            if (!(form instanceof HTMLFormElement)) return;
+            if (form.hasAttribute('data-no-rsc')) return;
+            const actionId = form.getAttribute('action');
+            if (!actionId || actionId.startsWith('#')) return;
+            e.preventDefault();
+            const payload = {};
+            for (const [k, v] of new FormData(form).entries()) payload[k] = v;
+            runAction(actionId, payload);
+        }, true);
+
+        window.addEventListener('popstate', () => {
+            load(location.pathname + location.search,
+                 { historyMode: 'replace', context: 'popstate' });
+        });
+    }
+
+    // The only public client surface. `action` is called directly by client
+    // components; `navigate` is wired to link clicks and popstate below.
+    const rsc = {
+        navigate,
+        action: runAction,
+        version: 'rscpp-react19-flight'
+    };
+    window.rsc = rsc;
+
+    function boot() {
+        install();
+
+        const dataEl = document.getElementById('__RSC_DATA__');
+        if (dataEl) {
+            decoder.reset();
+            try {
+                decoder.feed(JSON.parse(dataEl.textContent));
+            } catch (e) {
+                reportFatal(e, 'parse embedded Flight payload');
+                return;
+            }
+            if (decoder.error !== null) {
+                reportFatal(new Error(decoder.error), 'embedded Flight payload');
+                return;
+            }
+            if (!decoder.has(0)) {
+                reportFatal(new Error('no root row in the embedded payload'), 'hydrate');
+                return;
+            }
+
+            const drainQueued = () => {
+                const queued = window.__RSC_ROWS__;
+                if (!queued || !queued.length) return;
+                const rows = queued.splice(0, queued.length);
+                for (const row of rows) decoder.feed(row);
+                if (decoder.error !== null) {
+                    reportFatal(new Error(decoder.error), 'streamed boundary rows');
+                }
+            };
+            window.__RSC_ROWS_PUSH__ = drainQueued;
+            drainQueued();
+            if (decoder.error !== null) return;
+
+            try {
+                hydrateTree(resolveElement(decoder.chunks.get(0), decoder));
+            } catch (e) {
+                reportFatal(e, 'hydrate');
+                return;
+            }
+            window.dispatchEvent(new CustomEvent('rsc:hydrated', { detail: { rootId: 'root' } }));
+            return;
+        }
+
+        navigate(location.pathname + location.search);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+})();

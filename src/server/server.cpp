@@ -290,11 +290,19 @@ void RSCServer::handle_action_response(StreamResponse& resp, const RequestInfo& 
         return;
     }
 
-    Renderer renderer(registry_, ctx);
+    // An action response is not a streaming endpoint, so the re-render must be
+    // complete before any row is written. Shared ownership is load-bearing:
+    // a suspended boundary spawns a detached thread that re-enters this
+    // renderer through a weak_ptr, which requires the Renderer to be owned by
+    // a shared_ptr. Stack-allocating it threw bad_weak_ptr. drain_pending()
+    // then runs the retry tasks, so the boundary's chunk is resolved rather
+    // than left as an $L reference the client could never fetch.
+    auto renderer = std::make_shared<Renderer>(registry_, ctx);
     const auto t_render0 = std::chrono::steady_clock::now();
-    renderer.render(node);
+    renderer->render(node);
+    renderer->drain_pending();
     const auto t_render1 = std::chrono::steady_clock::now();
-    for (const auto& row : renderer.rows()) {
+    for (const auto& row : renderer->rows()) {
         if (!resp.write(row.to_wire())) return;
     }
     const auto t_written = std::chrono::steady_clock::now();

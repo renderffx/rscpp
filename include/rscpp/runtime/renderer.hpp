@@ -58,11 +58,6 @@ public:
         return aborted_;
     }
 
-    size_t pending_count() const {
-        std::lock_guard lock(queue_mutex_);
-        return pending_;
-    }
-
     void drain_pending() {
         for (;;) {
             std::function<void()> task;
@@ -228,7 +223,6 @@ private:
     NodePtr resolve_node(const NodePtr& n) {
         if (!n) return n;
         if (n->type != NodeType::DYNAMIC) return n;
-        if (n->component_fn) return n->component_fn(*ctx_);
         if (auto sc = ctx_->registry().get_server(n->tag)) return sc->fn(*ctx_);
         throw std::runtime_error("Unknown server component: " + n->tag);
     }
@@ -312,9 +306,8 @@ private:
             case NodeType::ERROR_BOUNDARY:
                 return serialize_error_boundary_node(node, html_out);
             case NodeType::DYNAMIC:
-                // A component that resolved to a bare reference with no
-                // component_fn and no registry entry. Rendering nothing is
-                // correct; silently rendering the tag name would not be.
+                // A component reference with no registry entry. Rendering
+                // nothing is correct; rendering the tag name would not be.
                 return Json(nullptr);
         }
         return Json(nullptr);

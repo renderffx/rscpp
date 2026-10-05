@@ -49,12 +49,6 @@ public:
         return request_;
     }
 
-    std::string query_value(const std::string& name) const {
-        std::shared_lock lock(mutex_);
-        auto it = request_.query.find(name);
-        return it != request_.query.end() ? it->second : std::string();
-    }
-
     std::string param(const std::string& name) const {
         std::shared_lock lock(mutex_);
         auto it = request_.params.find(name);

@@ -3,7 +3,6 @@
 #include "rscpp/model/value.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -34,7 +33,6 @@ struct Node {
     NodePtr fallback;
     std::string export_name = "default";
     std::string key;
-    std::function<NodePtr(Context&)> component_fn;
 
     static NodePtr element(std::string tag, Props props, Children children) {
         auto n = std::make_shared<Node>();
@@ -65,15 +63,6 @@ struct Node {
         auto n = std::make_shared<Node>();
         n->type = NodeType::DYNAMIC;
         n->tag = std::move(name);
-        return n;
-    }
-
-    static NodePtr dynamic(std::function<NodePtr(Context&)> fn, Props props = {}) {
-        auto n = std::make_shared<Node>();
-        n->type = NodeType::DYNAMIC;
-        n->tag = "#fn";
-        n->props = std::move(props);
-        n->component_fn = std::move(fn);
         return n;
     }
 

@@ -51,15 +51,9 @@ struct Route {
 
 class Router {
 public:
-    void set_base_path(std::string path) {
-        while (!path.empty() && path.front() == '/') path.erase(0, 1);
-        while (!path.empty() && path.back() == '/') path.pop_back();
-        base_path_ = path.empty() ? std::string() : "/" + path;
-    }
-
     void add_route(std::string pattern,
                    std::function<NodePtr(const std::smatch&, Context&)> handler) {
-        routes_.emplace_back(base_path_ + pattern, std::move(handler));
+        routes_.emplace_back(pattern, std::move(handler));
     }
 
     NodePtr resolve(const std::string& path, Context& ctx) {
@@ -114,7 +108,6 @@ public:
 
 private:
     std::vector<Route> routes_;
-    std::string base_path_;
 };
 
 }

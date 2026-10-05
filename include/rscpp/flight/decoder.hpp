@@ -86,8 +86,6 @@ public:
 
     bool ok() const { return !failed_; }
     const std::string& error() const { return error_; }
-    // True while bytes are buffered for a row that is not yet complete.
-    bool has_partial() const { return head_ < buf_.size(); }
 
 private:
     // A uint64 is 16 hex digits; that is the width of both ids and lengths.

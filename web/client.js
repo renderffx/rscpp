@@ -220,10 +220,14 @@
 
     function isRefString(s) {
         if (typeof s !== 'string' || s.length < 2) return false;
+        if (s.startsWith('$$')) return false;  // escaped literal, e.g. "$$L9" -> "$L9"
         if (s === '$undefined' || s === '$Infinity' || s === '$-Infinity' ||
             s === '$NaN' || s === '$-0') return true;
+        // `$h` is React 19.3's server-reference prefix ($F before that); both
+        // decode to a server action here.
         if (s.startsWith('$L') || s.startsWith('$@') || s.startsWith('$F') ||
-            s.startsWith('$S') || s.startsWith('$D') || s.startsWith('$n')) return true;
+            s.startsWith('$h') || s.startsWith('$S') || s.startsWith('$D') ||
+            s.startsWith('$n')) return true;
         if (s[0] === '$' && /^[0-9a-f]+$/.test(s.slice(1))) return true;
         return false;
     }
@@ -248,17 +252,21 @@
         }
         if (s.startsWith('$@')) return { __promise: parseInt(s.slice(2), 16) };
         if (s.startsWith('$F')) return { __serverAction: parseInt(s.slice(2), 16) };
+        if (s.startsWith('$h')) return { __serverAction: parseInt(s.slice(2), 16) };
         if (s[0] === '$') {
             const id = parseInt(s.slice(1), 16);
             const meta = decoder.chunks.get(id);
-            if (meta === undefined) return s; 
+            if (meta === undefined) return { __ref: id };
             return resolveValue(meta, decoder);
         }
         return s;
     }
 
     function resolveValue(v, decoder) {
-        if (typeof v === 'string') return isRefString(v) ? resolveRef(v, decoder) : v;
+        if (typeof v === 'string') {
+            if (v.startsWith('$$')) return v.slice(1);  // unescape literal
+            return isRefString(v) ? resolveRef(v, decoder) : v;
+        }
         if (Array.isArray(v)) {
             if (v.length > 0 && v[0] === '$') return resolveElement(v, decoder);
             return v.map((x) => resolveValue(x, decoder));
@@ -281,6 +289,52 @@
             return type;
         }
         return type;
+    }
+
+    // Walks a resolved value and collects the row ids it is still waiting on.
+    // These are `$L`, `$@` and value-reference slots whose rows have not
+    // arrived yet; a boundary shows its fallback until all of them land.
+    function collectPending(v, out) {
+        if (v == null || typeof v !== 'object') return;
+        if (Array.isArray(v)) {
+            for (const x of v) collectPending(x, out);
+            return;
+        }
+        if (v.__lazy !== undefined || v.__promise !== undefined || v.__ref !== undefined) {
+            const id = v.__lazy !== undefined ? v.__lazy
+                : v.__promise !== undefined ? v.__promise : v.__ref;
+            if (!out.includes(id)) out.push(id);
+            return;
+        }
+        for (const k in v) collectPending(v[k], out);
+    }
+
+    // Re-resolves a value after its pending rows have arrived: markers become
+    // the values their rows carry, recursively, so a slot that resolved to an
+    // element containing another pending slot keeps working.
+    function reResolveValue(v, decoder) {
+        if (typeof v === 'string') return resolveValue(v, decoder);
+        if (Array.isArray(v)) {
+            if (v.length > 0 && v[0] === '$') {
+                return ['$', reResolveValue(v[1], decoder), v[2], reResolveValue(v[3] || {}, decoder)];
+            }
+            return v.map((x) => reResolveValue(x, decoder));
+        }
+        if (v && typeof v === 'object') {
+            if (v.__client || v.__serverAction !== undefined) return v;
+            if (v.__lazy !== undefined || v.__promise !== undefined || v.__ref !== undefined) {
+                const id = v.__lazy !== undefined ? v.__lazy
+                    : v.__promise !== undefined ? v.__promise : v.__ref;
+                const chunk = decoder.get(id);
+                if (chunk === undefined) return v;
+                if (v.__lazy !== undefined && chunk && chunk.__client) return chunk;
+                return reResolveValue(chunk, decoder);
+            }
+            const out = {};
+            for (const k in v) out[k] = reResolveValue(v[k], decoder);
+            return out;
+        }
+        return v;
     }
 
     // The server encodes Suspense as the "$Sreact.suspense" symbol reference,
@@ -355,16 +409,26 @@
             await mountNode(node, parent);
             return;
         }
-        if (child.__lazy !== undefined) {
-            const val = await decoder.whenOrNull(child.__lazy);
-            if (val === null) { mountError(parent, 'client reference never arrived'); return; }
-            await mountNode(resolveElement(asElementArray(val), decoder), parent);
-            return;
-        }
-        if (child.__promise !== undefined) {
-            const val = await decoder.whenOrNull(child.__promise);
-            if (val === null) { mountError(parent, 'promised value never arrived'); return; }
-            await mountNode(resolveElement(asElementArray(val), decoder), parent);
+        // A slot that is still waiting on a row mounts as soon as its row
+        // lands, without holding up the siblings: the anchor span keeps the
+        // sibling order while the content is mounted out of tree.
+        if (child.__lazy !== undefined || child.__promise !== undefined || child.__ref !== undefined) {
+            const id = child.__lazy !== undefined ? child.__lazy
+                : child.__promise !== undefined ? child.__promise : child.__ref;
+            const isLazy = child.__lazy !== undefined;
+            const anchor = document.createElement('span');
+            anchor.style.display = 'none';
+            parent.appendChild(anchor);
+            decoder.when(id).then(async () => {
+                const resolved = reResolveValue(child, decoder);
+                if (resolved === child) return;  // row landed but carried no value
+                await mountChild(resolved, anchor);
+                while (anchor.firstChild) parent.insertBefore(anchor.firstChild, anchor);
+                anchor.remove();
+            }).catch(() => {
+                if (isLazy) mountError(parent, 'client reference never arrived');
+                else mountError(parent, 'promised value never arrived');
+            });
             return;
         }
         if (child.__serverAction !== undefined) return;
@@ -423,17 +487,16 @@
     }
 
     async function mountSuspense(node, parent) {
-        const child = node.props.children;
-        const lazy = (child && typeof child === 'object' && child.__lazy !== undefined)
-            ? child.__lazy : null;
-        const promise = (child && typeof child === 'object' && child.__promise !== undefined)
-            ? child.__promise : null;
+        const raw = node.props.children;
+        const pending = [];
+        collectPending(raw, pending);
 
-        if (lazy === null && promise === null) {
-            if (child == null) {
+        if (!pending.length) {
+            // Nothing is waiting: no boundary wrapper, no fallback flash.
+            if (raw == null) {
                 await mountNode(node.props.fallback, parent);
             } else {
-                await mountNode(child, parent);
+                await mountNode(raw, parent);
             }
             return;
         }
@@ -451,16 +514,19 @@
 
         if (node.props.fallback) await mountNode(node.props.fallback, fb);
 
-        const showContent = async (contentNode) => {
-            fb.style.display = 'none';
-            ct.style.display = '';
-            await mountNode(contentNode, ct);
-        };
-
-        const waitId = lazy === null ? promise : lazy;
-        const swap = (val) => showContent(resolveElement(asElementArray(val), decoder));
-        const cached = decoder.whenOrNull(waitId);
-        cached.then((val) => { if (val !== null) swap(val); });
+        // Real React suspends at whatever slot is pending, not at the
+        // boundary: only the rows this subtree is actually waiting on gate
+        // the swap. Siblings outside the boundary were already mounted.
+        Promise.all(pending.map((id) => decoder.when(id).catch(() => null))).then(async () => {
+            try {
+                const resolved = reResolveValue(raw, decoder);
+                fb.style.display = 'none';
+                ct.style.display = '';
+                await mountNode(resolved, ct);
+            } catch (e) {
+                mountError(fb, 'boundary failed: ' + (e && e.message ? e.message : e));
+            }
+        });
     }
 
     function createComponentController(node, slot, comp) {
@@ -567,11 +633,24 @@
         return out;
     }
 
+    // Hidden `S:` segment sources can hold leftover copies of a client
+    // component's template (a boundary that resolved while the root was
+    // pending, or a retried root that inlined content whose source segment
+    // was never consumed). Only templates in visible markup belong to the
+    // tree being hydrated.
+    function findClientTemplate(refId) {
+        const all = document.querySelectorAll('template[data-rsc-client="' + refId + '"]');
+        for (const t of all) {
+            if (t.isConnected && !t.closest('[hidden]')) return t;
+        }
+        return null;
+    }
+
     function hydrateTree(node) {
         if (!node) return;
         if (node.type && typeof node.type === 'object' && node.type.__client) {
             const t = node.type;
-            const slot = document.querySelector('template[data-rsc-client="' + t.refId + '"]');
+            const slot = findClientTemplate(t.refId);
             if (slot && slot.parentNode) {
                 const placeholder = document.createElement('span');
                 slot.parentNode.replaceChild(placeholder, slot);
@@ -752,11 +831,186 @@
         });
     }
 
+    function drainQueuedRows() {
+        const queued = window.__RSC_ROWS__;
+        if (!queued || !queued.length) return;
+        const rows = queued.splice(0, queued.length);
+        for (const row of rows) decoder.feed(row);
+    }
+
+    function postponedToken() {
+        const meta = document.querySelector('meta[name="rsc-postponed"]');
+        return meta && meta.content ? meta.content : null;
+    }
+
+    // Patches every still-unpatched placeholder for a block id. Ids are minted
+    // by the server in one pass and reused across a root retry, so the same
+    // block id can legitimately appear more than once in the document (an
+    // orphaned hidden segment plus the live retried content): patch them all.
+    function patchBoundaryPlaceholders(id, source) {
+        const dests = document.querySelectorAll('[id="B:' + id + '"][data-rsc-boundary]');
+        for (const d of dests) {
+            while (d.firstChild) d.removeChild(d.firstChild);
+            for (const n of source.childNodes) d.appendChild(n.cloneNode(true));
+            d.removeAttribute('data-rsc-boundary');
+            d.classList.remove('rsc-boundary');
+        }
+        return dests.length;
+    }
+
+    // Segments that completed before their placeholder existed (a boundary
+    // resolving while the root is still pending) wait here and are matched up
+    // as soon as the parent content lands in the DOM.
+    function flushPendingSegments() {
+        const pending = window.__RSC_SEG_PENDING__;
+        if (pending) {
+            for (const id of Object.keys(pending)) {
+                const y = pending[id];
+                if (!y || !y.isConnected) { delete pending[id]; continue; }
+                if (patchBoundaryPlaceholders(id, y) > 0) {
+                    // Consumed: drop a connected hidden source so it cannot
+                    // shadow live templates or duplicate markup.
+                    if (y.parentNode) y.parentNode.removeChild(y);
+                    delete pending[id];
+                }
+            }
+        }
+        applyChunkErrors();
+        tryHydrateSegments();
+    }
+    window.__RSC_FLUSH_SEGMENTS__ = flushPendingSegments;
+
+    // A failed boundary never gets a segment: the server replaces its row with
+    // an `E` row. On the streaming/boot path nothing else swaps the fallback,
+    // so patch every still-unpatched placeholder an error row belongs to.
+    function applyChunkErrors() {
+        for (const [id, chunk] of decoder.chunks) {
+            if (!chunk || chunk.__error === undefined) continue;
+            const dests = document.querySelectorAll('[id="B:' + id.toString(16) + '"][data-rsc-boundary]');
+            for (const d of dests) {
+                d.removeAttribute('data-rsc-boundary');
+                d.classList.remove('rsc-boundary');
+                d.replaceChildren();
+                const span = document.createElement('span');
+                span.className = 'rsc-error-fallback';
+                span.textContent = '[server error] ' + chunk.__error;
+                d.appendChild(span);
+            }
+        }
+    }
+
+    // Boundary ids whose resumed content may carry client components. A
+    // segment's markup can land after its row (parked in the pending registry)
+    // or appear inside a parent segment patched later, so hydration is retried
+    // every time segments are flushed into the document.
+    const resumeSegmentIds = new Set();
+
+    function tryHydrateSegments() {
+        if (!resumeSegmentIds.size) return;
+        for (const id of [...resumeSegmentIds]) {
+            const chunk = decoder.get(parseInt(id, 16));
+            if (chunk === undefined) continue;
+            let element;
+            try {
+                element = resolveElement(asElementArray(chunk), decoder);
+            } catch (e) { resumeSegmentIds.delete(id); continue; }
+
+            const refs = [];
+            (function collect(n) {
+                if (!n || typeof n !== 'object') return;
+                if (n.type && typeof n.type === 'object' && n.type.__client) {
+                    refs.push(n.type.refId);
+                    return;
+                }
+                if (n.type === FRAGMENT_TYPE || isSuspenseType(n.type) ||
+                    typeof n.type === 'string') {
+                    for (const c of childrenOf(n)) collect(c);
+                }
+            })(element);
+
+            if (!refs.length) { resumeSegmentIds.delete(id); continue; }
+            const ready = refs.every((r) => findClientTemplate(r) !== null);
+            if (!ready) continue;  // still parked; the next flush retries
+            try {
+                hydrateTree(element);
+            } catch (e) { /* stays server-rendered */ }
+            resumeSegmentIds.delete(id);
+        }
+    }
+
+    // Applies a resume stream to the document. The stream carries row scripts
+    // (the rows the shell was waiting on) and segment templates keyed by the
+    // ids the pre-render already reserved. Nothing in the shell is re-rendered.
+    async function applyResumeStream(html) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+
+        for (const s of doc.querySelectorAll('script[data-rsc-row]')) {
+            let row;
+            try { row = JSON.parse(s.textContent); } catch (e) { continue; }
+            decoder.feed(row);
+        }
+        if (decoder.error !== null) throw new Error('malformed resume stream: ' + decoder.error);
+        drainQueuedRows();
+
+        const errorIds = new Set();
+        for (const [id, chunk] of decoder.chunks) {
+            if (chunk && chunk.__error !== undefined) errorIds.add(id.toString(16));
+        }
+
+        const segments = [];
+        for (const t of doc.querySelectorAll('template[data-rsc-segment]')) {
+            const id = t.getAttribute('data-rsc-boundary-id');
+            const holder = document.createElement('div');
+            holder.appendChild(document.importNode(t.content, true));
+            // An empty segment for an error row carries no content: keep the
+            // placeholder so applyChunkErrors can render `[server error]` into
+            // it instead of consuming it with nothing.
+            if (!holder.firstChild && errorIds.has(id)) continue;
+            segments.push(id);
+            if (patchBoundaryPlaceholders(id, holder) === 0) {
+                (window.__RSC_SEG_PENDING__ = window.__RSC_SEG_PENDING__ || {})[id] = holder;
+            }
+        }
+        flushPendingSegments();
+        return segments;
+    }
+
+    // PPR resumption: fetch the continuation for the shell's postponement and
+    // splice it in. The pre-render never waited on the parked data, so this is
+    // where "slow" content actually arrives.
+    async function resumeNow() {
+        const token = postponedToken();
+        if (!token) return false;
+        try {
+            const resp = await fetch('/rsc/resume/' + encodeURIComponent(token), {
+                headers: { Accept: 'text/html' },
+                credentials: 'same-origin'
+            });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const segments = await applyResumeStream(await resp.text());
+
+            // The root row may live in the shell (root resolved during the
+            // pre-render) or arrive in this stream (root was postponed too).
+            if (!decoder.has(0)) throw new Error('resume stream did not deliver a root row');
+
+            // Mount client components that arrived inside the new segments.
+            // Segments whose markup is still parked self-retry on flush.
+            for (const id of segments) resumeSegmentIds.add(id);
+            tryHydrateSegments();
+            window.dispatchEvent(new CustomEvent('rsc:resumed', { detail: { boundaries: segments } }));
+            return true;
+        } catch (e) {
+            window.dispatchEvent(new CustomEvent('rsc:resume-error', { detail: { error: e } }));
+            return false;
+        }
+    }
+
     // The only public client surface. `action` is called directly by client
     // components; `navigate` is wired to link clicks and popstate below.
     const rsc = {
         navigate,
         action: runAction,
+        resume: resumeNow,
         version: 'rscpp-react19-flight'
     };
     window.rsc = rsc;
@@ -777,31 +1031,70 @@
                 reportFatal(new Error(decoder.error), 'embedded Flight payload');
                 return;
             }
+
+            const token = postponedToken();
+            window.__RSC_ROWS_PUSH__ = () => {
+                drainQueuedRows();
+                if (decoder.error !== null) {
+                    reportFatal(new Error(decoder.error), 'streamed boundary rows');
+                    return;
+                }
+                // Boundary rows can reveal client components; re-hydrating is
+                // idempotent (consumed templates are already replaced).
+                if (decoder.has(0)) {
+                    const chunk = decoder.chunks.get(0);
+                    // An error root has no element to hydrate: applyChunkErrors
+                    // already rendered the fallback into its boundary.
+                    if (chunk && chunk.__error === undefined) {
+                        try {
+                            hydrateTree(resolveElement(chunk, decoder));
+                        } catch (e) { /* non-fatal */ }
+                    }
+                }
+                flushPendingSegments();
+            };
+            drainQueuedRows();
+            applyChunkErrors();
+            if (decoder.error !== null) return;
+
             if (!decoder.has(0)) {
-                reportFatal(new Error('no root row in the embedded payload'), 'hydrate');
+                if (!token) {
+                    reportFatal(new Error('no root row in the embedded payload'), 'hydrate');
+                    return;
+                }
+                // The entire content was postponed; resumption carries the root.
+                resumeNow();
                 return;
             }
 
-            const drainQueued = () => {
-                const queued = window.__RSC_ROWS__;
-                if (!queued || !queued.length) return;
-                const rows = queued.splice(0, queued.length);
-                for (const row of rows) decoder.feed(row);
-                if (decoder.error !== null) {
-                    reportFatal(new Error(decoder.error), 'streamed boundary rows');
+            const rootChunk = decoder.chunks.get(0);
+            if (rootChunk && rootChunk.__error !== undefined) {
+                // The root render failed: applyChunkErrors turns the root
+                // placeholder into an error fallback when one exists; if the
+                // shell carried no placeholder, render the error into #root so
+                // the page is never silently blank.
+                const container = document.getElementById('root') || document.body;
+                if (!container.querySelector('.rsc-error-fallback')) {
+                    container.replaceChildren();
+                    const span = document.createElement('span');
+                    span.className = 'rsc-error-fallback';
+                    span.textContent = '[server error] ' + rootChunk.__error;
+                    container.appendChild(span);
                 }
-            };
-            window.__RSC_ROWS_PUSH__ = drainQueued;
-            drainQueued();
-            if (decoder.error !== null) return;
-
+                window.dispatchEvent(new CustomEvent('rsc:hydrated', { detail: { rootId: 'root', error: rootChunk.__error } }));
+                return;
+            }
             try {
-                hydrateTree(resolveElement(decoder.chunks.get(0), decoder));
+                hydrateTree(resolveElement(rootChunk, decoder));
             } catch (e) {
                 reportFatal(e, 'hydrate');
                 return;
             }
             window.dispatchEvent(new CustomEvent('rsc:hydrated', { detail: { rootId: 'root' } }));
+
+            // A postponed shell hydrates instantly and then resumes: fallbacks
+            // are visible from the first paint, slow data arrives after.
+            if (token) resumeNow();
             return;
         }
 

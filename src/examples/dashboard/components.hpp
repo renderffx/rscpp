@@ -93,6 +93,10 @@ inline rscpp::NodePtr async_stage(rscpp::Context& ctx, const std::string& key, i
              {rscpp::Node::text("resolved after " + std::to_string(elapsed) + "ms")})});
 }
 
+inline rscpp::NodePtr StageRootBoom(rscpp::Context&) {
+    throw std::runtime_error("root component exploded");
+}
+
 inline rscpp::NodePtr StageQuick(rscpp::Context& ctx) {
     rscpp::NodePtr stage = async_stage(ctx, "hardcore-quick", 150, "quick stage (150ms)");
     // A literal that looks exactly like a reference: must survive `$$`

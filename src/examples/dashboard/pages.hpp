@@ -166,6 +166,12 @@ inline rscpp::NodePtr HardcorePage(const std::smatch&, rscpp::Context& ctx) {
              rscpp::Node::text(" | after boom")}));
     }
 
+    if (ctx.request().query.count("rootboom") > 0) {
+        // The root component itself throws: no boundary can catch it, so the
+        // failure is a root-level `E` row (never a blank shell).
+        return rscpp::Node::component("StageRootBoom");
+    }
+
     rscpp::Props props;
     props["title"] = rscpp::Value("Hardcore");
     return rscpp::Node::element("div", props, std::move(children));

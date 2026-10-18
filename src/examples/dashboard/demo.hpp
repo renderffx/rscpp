@@ -49,6 +49,9 @@ inline void register_components(rscpp::Registry& registry) {
     registry.register_server_component(
         rscpp::ServerComponent{"StageBoomBare",
                                [](rscpp::Context& ctx) { return StageBoomBare(ctx); }});
+    registry.register_server_component(
+        rscpp::ServerComponent{"StageRootBoom",
+                               [](rscpp::Context& ctx) { return StageRootBoom(ctx); }});
 
     registry.register_client_component(like_button_component());
 }

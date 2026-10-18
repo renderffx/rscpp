@@ -12,9 +12,13 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace rscpp {
@@ -75,15 +79,28 @@ private:
     void handle_flight_response(StreamResponse& resp, const RequestInfo& req_info, bool found);
     void handle_html_response(StreamResponse& resp, const RequestInfo& req_info, bool found,
                               const std::string& nonce);
+    void handle_prerender_response(StreamResponse& resp, const RequestInfo& req_info,
+                                   bool found, const std::string& nonce);
+    void handle_resume_response(StreamResponse& resp, const std::string& token);
     void handle_action_response(StreamResponse& resp, const RequestInfo& req_info,
                                 const std::string& action_id, const Value& args,
                                 const std::string& path, const std::string& error);
     std::string build_shell_head(const std::string& title, const std::string& flight_wire,
-                                 const std::string& nonce) const;
+                                 const std::string& nonce,
+                                 const std::string& postponed_token = std::string()) const;
     std::string build_shell_tail(const std::string& nonce) const;
+
+    std::string store_postponed(PostponedState state);
+    std::optional<PostponedState> take_postponed(const std::string& token);
+    void sweep_postponed();
 
     void setup_signal_handlers();
     static void signal_handler(int sig);
+
+    struct PostponedEntry {
+        PostponedState state;
+        std::chrono::steady_clock::time_point expires;
+    };
 
     ServerConfig config_;
     Registry registry_;
@@ -94,6 +111,11 @@ private:
     RateLimiter rate_limiter_;
     std::atomic<bool> shutting_down_{false};
     std::thread janitor_;
+
+    // In-process, exactly like React's `postponed` object: it references live
+    // nodes and context, so it can only be resumed by this process.
+    mutable std::mutex postponed_mutex_;
+    std::unordered_map<std::string, PostponedEntry> postponed_;
 
     static std::atomic<RSCServer*> instance_;
 };

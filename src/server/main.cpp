@@ -30,6 +30,7 @@ constexpr RouteEntry kRoutes[] = {
     {"/products/:id", demo::ProductPage},
     {"/search", demo::SearchPage},
     {"/error", demo::ErrorPage},
+    {"/hardcore", demo::HardcorePage},
     {"/suspense", demo::SuspensePage},
     {"/userlist", demo::UserListPage},
     {"/userlist/:data", demo::UserListPageWithData},

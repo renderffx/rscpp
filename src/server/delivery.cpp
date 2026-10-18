@@ -68,13 +68,36 @@ std::string page_title(const NodePtr& node) {
 }
 
 std::string boundary_runtime(const std::string& nonce) {
+    // A completed segment patches *every* unpatched placeholder with its
+    // block id, not just the first: when the root retried after an earlier
+    // segment was already streamed, stale copies of the placeholder can exist
+    // in orphaned (hidden) segments while the live one sits in the retried
+    // content. If no placeholder exists yet the segment is kept in the pending
+    // registry and matched as soon as the parent content lands.
     return "<script nonce=\"" + nonce +
-           "\">window.$RC=function(b,s,r){var x=document.getElementById(b),y=document.getElementById(s);"
-           "if(x&&y){while(x.firstChild)x.removeChild(x.firstChild);"
-           "while(y.firstChild)x.appendChild(y.firstChild);"
-           "y.remove();x.removeAttribute('data-rsc-boundary')}"
+           // An `E` row never carries segment markup. Consuming the placeholder
+           // here would hide the boundary id from applyChunkErrors, which is the
+           // only thing that can render `[server error]` into it -- the page
+           // would silently come up blank instead. Publish the row and leave the
+           // placeholder alone.
+           "\">window.$RC=function(b,s,r){if(!/^[0-9a-f]+:E/.test(r)){"
+           "var y=document.getElementById(s);if(y){var d=document.querySelectorAll('[id=\"'+b+'\"]"
+           "[data-rsc-boundary]');var p=window.__RSC_SEG_PENDING__||(window.__RSC_SEG_PENDING__={});"
+           "if(d.length){for(var i=0;i<d.length;i++){var x=d[i];while(x.firstChild)x.removeChild(x.firstChild);"
+           "for(var j=0;j<y.childNodes.length;j++)x.appendChild(y.childNodes[j].cloneNode(true));"
+           "x.removeAttribute('data-rsc-boundary')}delete p[b];"
+           "if(y.parentNode)y.parentNode.removeChild(y)}else{p[b]=y}}}"
            "(window.__RSC_ROWS__=window.__RSC_ROWS__||[]).push(r);"
-           "if(window.__RSC_ROWS_PUSH__)window.__RSC_ROWS_PUSH__()};"
+           "if(window.__RSC_ROWS_PUSH__)window.__RSC_ROWS_PUSH__();"
+           "if(window.__RSC_FLUSH_SEGMENTS__)window.__RSC_FLUSH_SEGMENTS__()};"
+           "window.__RSC_FLUSH_SEGMENTS__=function(){var p=window.__RSC_SEG_PENDING__;if(!p)return;"
+           "for(var b in p){var y=p[b];if(!y||!y.isConnected){delete p[b];continue}"
+           "var d=document.querySelectorAll('[id=\"'+b+'\"]"
+           "[data-rsc-boundary]');if(!d.length)continue;"
+           "for(var i=0;i<d.length;i++){var x=d[i];while(x.firstChild)x.removeChild(x.firstChild);"
+           "for(var j=0;j<y.childNodes.length;j++)x.appendChild(y.childNodes[j].cloneNode(true));"
+           "x.removeAttribute('data-rsc-boundary')}delete p[b];"
+           "if(y.parentNode)y.parentNode.removeChild(y)}};"
            "window.$R=function(r){(window.__RSC_ROWS__=window.__RSC_ROWS__||[]).push(r);"
            "if(window.__RSC_ROWS_PUSH__)window.__RSC_ROWS_PUSH__()};</script>";
 }

@@ -117,6 +117,60 @@ inline rscpp::NodePtr PostsPage(const std::smatch&, rscpp::Context&) {
     });
 }
 
+inline rscpp::NodePtr HardcorePage(const std::smatch&, rscpp::Context& ctx) {
+    auto fallback = [](const char* label) {
+        return rscpp::Node::element("div", {{"class", "rsc-fallback"}},
+                                    {rscpp::Node::text(label)});
+    };
+
+    rscpp::Children children;
+    children.push_back(rscpp::Node::element("h1", {}, {rscpp::Node::text("Hardcore Streaming")}));
+    children.push_back(rscpp::Node::element(
+        "p", {},
+        {rscpp::Node::text(
+            "Each stage sleeps on a worker thread. Boundaries stream as they "
+            "resolve; the response never blocks on any of them.")}));
+    children.push_back(rscpp::Node::element(
+        "p", {},
+        {rscpp::Node::text(
+            "Try ?ppr=1: the shell with every fallback is served immediately and "
+            "the server resumes the parked stages on a second request.")}));
+
+    children.push_back(rscpp::Node::suspense({rscpp::Node::component("StageQuick")},
+                                             fallback("quick fallback (150ms)")));
+    children.push_back(rscpp::Node::suspense({rscpp::Node::component("StageMedium")},
+                                             fallback("medium fallback (450ms)")));
+    children.push_back(rscpp::Node::suspense({rscpp::Node::component("StageSlow")},
+                                             fallback("slow fallback (900ms)")));
+    children.push_back(rscpp::Node::suspense({rscpp::Node::component("StageOuter")},
+                                             fallback("outer fallback (500ms + 250ms)")));
+
+    if (ctx.request().query.count("root") > 0) {
+        // A suspension with no enclosing boundary: one slot, three children.
+        children.push_back(rscpp::Node::element(
+            "div", {{"class", "rsc-probe"}},
+            {rscpp::Node::text("before the bare slot | "),
+             rscpp::Node::component("StageProbe"),
+             rscpp::Node::text(" | after the bare slot")}));
+    }
+
+    if (ctx.request().query.count("boom") > 0) {
+        children.push_back(rscpp::Node::suspense(
+            {rscpp::Node::component("StageBoom")}, fallback("boom fallback (fails at 300ms)")));
+    }
+
+    if (ctx.request().query.count("boombare") > 0) {
+        children.push_back(rscpp::Node::element(
+            "div", {{"class", "rsc-probe"}},
+            {rscpp::Node::text("before boom | "), rscpp::Node::component("StageBoomBare"),
+             rscpp::Node::text(" | after boom")}));
+    }
+
+    rscpp::Props props;
+    props["title"] = rscpp::Value("Hardcore");
+    return rscpp::Node::element("div", props, std::move(children));
+}
+
 inline rscpp::NodePtr SuspensePage(const std::smatch&, rscpp::Context&) {
     rscpp::Props props;
     props["loaded"] = rscpp::Value(false);

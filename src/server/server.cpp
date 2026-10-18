@@ -60,6 +60,15 @@ void RSCServer::setup_routes() {
         handle_manifest(res);
     });
 
+    server_.Get(R"(/rsc/resume/([0-9a-f]+))", [this, make_pipe](const httplib::Request& req,
+                                                                 httplib::Response& res) {
+        const std::string token = req.matches[1].str();
+        res.status = 200;
+        auto resp = std::make_shared<StreamResponse>(res, make_pipe(),
+                                                     StreamResponse::Kind::HTML);
+        resp->start([this, resp, token](StreamResponse& h) { handle_resume_response(h, token); });
+    });
+
     server_.Get(R"(/rsc(/.*)?)", [this, make_pipe](const httplib::Request& req,
                                                    httplib::Response& res) {
         std::string path = req.matches[1].str();
@@ -139,10 +148,12 @@ void RSCServer::setup_routes() {
 
         const RequestInfo info = delivery::request_info_from(req, path, "GET");
         const std::string nonce = current_nonce();
+        const bool ppr = req.has_param("ppr") && req.get_param_value("ppr") != "0";
         auto resp =
             std::make_shared<StreamResponse>(res, make_pipe(), StreamResponse::Kind::HTML);
-        resp->start([this, resp, info, found, nonce](StreamResponse& h) {
-            handle_html_response(h, info, found, nonce);
+        resp->start([this, resp, info, found, nonce, ppr](StreamResponse& h) {
+            if (ppr) handle_prerender_response(h, info, found, nonce);
+            else handle_html_response(h, info, found, nonce);
         });
     });
 }
@@ -243,6 +254,121 @@ void RSCServer::handle_html_response(StreamResponse& resp, const RequestInfo& re
               "ms, path=", req_info.path);
 }
 
+void RSCServer::handle_prerender_response(StreamResponse& resp, const RequestInfo& req_info,
+                                          bool found, const std::string& nonce) {
+    metrics_.record_html();
+
+    auto ctx = std::make_shared<Context>();
+    ctx->init(req_info, registry_);
+
+    NodePtr node = found ? router_.resolve(req_info.path, *ctx) : nullptr;
+    if (!node) {
+        if (resp.write(delivery::error_page(404, "Not Found", "No route matches: " +
+                                                            req_info.path)))
+            resp.end();
+        return;
+    }
+
+    auto sink = std::make_shared<SsrStreamSink>(nonce);
+    sink->set_response(&resp);
+
+    auto renderer = std::make_shared<Renderer>(registry_, ctx);
+    renderer->enable_html();
+    renderer->set_sink(sink.get());
+    renderer->set_html_sink(sink.get());
+
+    // Pre-render: everything synchronously ready is serialized; every
+    // suspension is parked into the postponed state instead of being waited
+    // on. The response ends here with the shell and its placeholders -- data
+    // that takes time cannot delay the first byte. `resume` picks up from
+    // exactly these parked slots later.
+    const auto t0 = std::chrono::steady_clock::now();
+    PostponedState state = renderer->prerender(node);
+    // No postponement, no token: the shell is already complete and the client
+    // has nothing to resume. Minting a token anyway would make every visit of
+    // an all-static page fire a pointless second request.
+    std::string token;
+    if (!state.pending.empty()) token = store_postponed(std::move(state));
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const std::string title = delivery::page_title(node);
+    if (!resp.write(build_shell_head(title, sink->wire(), nonce, token))) return;
+    if (!sink->begin_body()) return;
+    sink->flush_rows();
+    if (resp.write(build_shell_tail(nonce))) resp.end();
+    const auto t2 = std::chrono::steady_clock::now();
+    RSC_DEBUG("html prerender: ",
+              std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
+              "ms serialize, ",
+              std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count(),
+              "ms write, path=", req_info.path);
+}
+
+void RSCServer::handle_resume_response(StreamResponse& resp, const std::string& token) {
+    auto state = take_postponed(token);
+    if (!state) {
+        if (resp.write("<div class=\"rsc-error-fallback\">Postponed state is missing or "
+                       "expired.</div>"))
+            resp.end();
+        return;
+    }
+
+    auto sink = std::make_shared<ResumeSink>();
+    sink->set_response(&resp);
+
+    // Same id space, same context as the pre-render. Only the parked slots
+    // are serialized; the shell is never re-rendered.
+    auto renderer = std::make_shared<Renderer>(registry_);
+    renderer->enable_html();
+    renderer->set_sink(sink.get());
+    renderer->set_html_sink(sink.get());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    renderer->resume(*state);
+    const auto t1 = std::chrono::steady_clock::now();
+    resp.end();
+    RSC_DEBUG("html resume: ",
+              std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
+              "ms, token=", token);
+}
+
+std::string RSCServer::store_postponed(PostponedState state) {
+    static std::atomic<uint64_t> counter{0x1000};
+    const uint64_t n = counter.fetch_add(1);
+    const std::string token = util::hex_digest(std::to_string(n) + ":" +
+                                               current_nonce() + ":" +
+                                               std::to_string(
+                                                   std::chrono::steady_clock::now()
+                                                       .time_since_epoch()
+                                                       .count()));
+    {
+        std::lock_guard lock(postponed_mutex_);
+        sweep_postponed();
+        postponed_[token] = PostponedEntry{std::move(state),
+                                           std::chrono::steady_clock::now() +
+                                               std::chrono::minutes(5)};
+    }
+    return token;
+}
+
+std::optional<PostponedState> RSCServer::take_postponed(const std::string& token) {
+    std::lock_guard lock(postponed_mutex_);
+    sweep_postponed();
+    auto it = postponed_.find(token);
+    if (it == postponed_.end()) return std::nullopt;
+    PostponedState state = std::move(it->second.state);
+    postponed_.erase(it);
+    return state;
+}
+
+void RSCServer::sweep_postponed() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = postponed_.begin(); it != postponed_.end();) {
+        if (it->second.expires <= now) it = postponed_.erase(it);
+        else ++it;
+    }
+}
+
 void RSCServer::handle_action_response(StreamResponse& resp, const RequestInfo& req_info,
                                        const std::string& action_id, const Value& args,
                                        const std::string& path, const std::string& error) {
@@ -316,12 +442,17 @@ void RSCServer::handle_action_response(StreamResponse& resp, const RequestInfo& 
 }
 
 std::string RSCServer::build_shell_head(const std::string& title, const std::string& flight_wire,
-                                        const std::string& nonce) const {
+                                        const std::string& nonce,
+                                        const std::string& postponed_token) const {
     std::string shell;
     shell.reserve(flight_wire.size() + 4096);
     shell += "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">";
     shell += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
     shell += "<title>" + html::escape_html(title) + "</title>";
+    if (!postponed_token.empty()) {
+        shell += "<meta name=\"rsc-postponed\" content=\"" +
+                 html::escape_html(postponed_token) + "\">";
+    }
     for (const auto& [name, cc] : registry_.client_components()) {
         (void)name;
         shell += "<link rel=\"modulepreload\" href=\"" + html::escape_html(cc.module) + "\">";

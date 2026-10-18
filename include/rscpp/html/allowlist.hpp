@@ -32,7 +32,8 @@ inline bool is_safe_tag(std::string_view tag) {
       "button",   "canvas",     "caption",  "cite",   "code",       "col",
       "colgroup", "data",       "datalist", "dd",     "del",        "details",
       "dfn",      "dialog",     "div",      "dl",     "dt",         "em",
-      "fieldset", "figcaption", "figure",   "footer", "h1",         "h2",
+      "fieldset", "figcaption", "figure",   "footer", "form",       "h1",
+      "h2",
       "h3",       "h4",         "h5",       "h6",     "header",     "hgroup",
       "hr",       "i",          "img",      "input",  "ins",        "kbd",
       "label",    "legend",     "li",       "main",   "map",        "mark",
@@ -148,7 +149,9 @@ inline bool is_known_html_attr(std::string_view name) {
       "target",
       "type",
       "src",
-      "srcdoc",
+      // "srcdoc" is deliberately absent: inline scripts inside a srcdoc
+      // document run in the page's origin, and with enable_csp=false nothing
+      // stops them.
       "sizes",
       "width",
       "height",

@@ -386,8 +386,11 @@
             // `open` is a real HTML attribute (details/dialog); only event
             // handler props start with `on`.
             if (k !== 'open' && k.startsWith('on')) continue;
-            if (k === 'dangerouslySetInnerHTML') continue; 
-            if (k === 'style') continue;                  
+            if (k === 'dangerouslySetInnerHTML') continue;
+            if (k === 'style') continue;
+            // Not allowlisted server-side either: inline scripts inside a
+            // srcdoc document execute in this origin.
+            if (k === 'srcdoc') continue;
             const v = props[k];
             if (v == null) continue;
             if (typeof v === 'object') continue; 
@@ -402,7 +405,10 @@
     async function mountChild(child, parent) {
         if (child == null) return;
         const t = typeof child;
-        if (t === 'string' || t === 'number' || t === 'boolean') {
+        // Booleans render nothing, matching React; only strings and numbers
+        // become text nodes.
+        if (t === 'boolean') return;
+        if (t === 'string' || t === 'number') {
             parent.appendChild(document.createTextNode(String(child)));
             return;
         }
@@ -565,7 +571,7 @@
             } else {
                 host.textContent = String(result == null ? '' : result);
             }
-            if (slot.isConnected) {
+            if (slot.isConnected || slot.parentNode) {
                 slot.replaceChildren(host);
             } else if (parent && parent.isConnected) {
                 const existing = parent.querySelector('.rsc-client');
@@ -581,13 +587,13 @@
             try {
                 result = comp(node.props || {}, api);
             } catch (e) {
-                if (slot.isConnected) slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
+                if (slot.parentNode) slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
                 console.error('[rsc] client component failed:', e);
                 return;
             }
             if (result && typeof result.then === 'function') {
                 result.then(commit).catch((e) => {
-                    if (slot.isConnected) slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
+                    if (slot.parentNode) slot.replaceChildren(document.createTextNode('[client component error] ' + e.message));
                     console.error('[rsc] client component failed:', e);
                 });
             } else {
@@ -773,7 +779,13 @@
         try {
             const resp = await fetch('/rsc/action', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', Accept: 'text/x-component' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'text/x-component',
+                    // Required by the server: a custom header no cross-origin
+                    // form or fetch can send without a preflight it never grants.
+                    'X-RSC-Action': '1'
+                },
                 credentials: 'same-origin',
                 body: JSON.stringify({
                     action_id: actionId,

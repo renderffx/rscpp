@@ -216,7 +216,6 @@ public:
         out += "</div><script nonce=\"" + nonce_ + "\">$RC(\"" + bid + "\",\"" + sid + "\",";
         out += html::js_string_literal(row);
         out += ")</script>";
-        sent_ = wire_.size();
         return resp_->write(out);
     }
 
@@ -236,6 +235,53 @@ private:
     std::string markup_;
     size_t sent_ = 0;
     bool body_started_ = false;
+    StreamResponse* resp_ = nullptr;
+};
+
+// A resume stream. Carries only what the pre-rendered shell is missing: the
+// rows for parked slots and the markup segments that replace their
+// placeholders. Nothing already sent is repeated, which is what makes resume
+// a continuation instead of a re-render.
+class ResumeSink final : public flight::RowSink, public HtmlSink {
+public:
+    explicit ResumeSink() = default;
+
+    bool write(std::string_view row) override {
+        if (!resp_) return false;
+        return resp_->write("<script type=\"application/json\" data-rsc-row>" +
+                            json_script_body(row) + "</script>");
+    }
+
+    // A resume stream has no shell; markup only arrives as boundary segments.
+    bool write_markup(std::string_view) override { return true; }
+
+    bool write_boundary_content(uint64_t id, std::string_view html,
+                                std::string_view /*row*/) override {
+        if (!resp_) return false;
+        std::string out = "<template data-rsc-segment id=\"S:";
+        out += flight::hex(id);
+        out += "\" data-rsc-boundary-id=\"";
+        out += flight::hex(id);
+        out += "\">";
+        out.append(html.data(), html.size());
+        out += "</template>";
+        return resp_->write(out);
+    }
+
+    void set_response(StreamResponse* resp) { resp_ = resp; }
+
+private:
+    static std::string json_script_body(std::string_view row) {
+        std::string encoded = nlohmann::json(std::string(row)).dump();
+        std::string out;
+        out.reserve(encoded.size());
+        for (char c : encoded) {
+            if (c == '<') out += "\\u003c";
+            else out += c;
+        }
+        return out;
+    }
+
     StreamResponse* resp_ = nullptr;
 };
 
